@@ -13,9 +13,12 @@ TARGETS := $(SOURCES:.asm=)
 
 # =================================================
 # Targets
+# NOTE: When adding rules, add what it does after
+# target: requisites preceeded by ## so targets
+# remain automatically documented
 # =================================================
 
-.PHONY: all help build clean bootloader
+.PHONY: all help build clean
 
 all: help
 
@@ -24,25 +27,15 @@ help: ## Show available targets
 	@grep -E '^[a-zA-Z0-9_%./-]+:.*?## ' $(MAKEFILE_LIST) | \
 	awk 'BEGIN {FS = ":.*?## "}; {printf "  %-20s %s\n", $$1, $$2}'
 
-build: $(TARGETS) ## Build all ELF64 ASM files
-
-bootloader: bootloader/bootloader.bin ## Build bootloader
+build: $(TARGETS) ## Build all ASM files
 
 clean: ## Remove generated files
+	@rm -f $(TARGETS)
 	@find . -type f -name "*.o" -delete
-	@rm -f bootloader/bootloader.bin
 
 
 # =================================================
-# Bootloader rule
-# =================================================
-
-bootloader/bootloader.bin: bootloader/bootloader.asm
-	$(ASM) -f bin $< -o $@
-
-
-# =================================================
-# Generic ELF64 ASM rule
+# Generic ASM rule
 # =================================================
 
 %: %.asm
