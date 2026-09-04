@@ -15,8 +15,7 @@ OVMF     ?= /usr/share/ovmf/OVMF.fd
 
 SRC_DIR  := src
 BUILD    := build
-
-OBJ      := $(BUILD)/main.obj
+OBJ      := $(BUILD)/main.obj $(BUILD)/clock.obj
 EFI      := $(BUILD)/BOOTX64.EFI
 IMG      := $(BUILD)/esp.img
 
@@ -34,15 +33,15 @@ all: help
 
 help: ## Show available targets
 	@echo "Available targets:"
-	@grep -E '^[a-zA-Z0-9_%./-]+:.*?## ' $(MAKEFILE_LIST) | \
-	awk 'BEGIN {FS = ":.*?## "}; {printf "  %-20s %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_%./-]+:.*## ' $(MAKEFILE_LIST) | \
+	awk 'BEGIN {FS = ":.*## "}; {printf "  %-20s %s\n", $$1, $$2}'
 
 build: $(EFI) ## Assemble and link the UEFI application (build/BOOTX64.EFI)
 
 image: $(IMG) ## Build a FAT32 EFI System Partition image with the app at /EFI/BOOT
 
 run: $(IMG) ## Build image and boot it in QEMU with OVMF
-	qemu-system-x86_64 -bios $(OVMF) -drive format=raw,file=$(IMG)
+	qemu-system-x86_64 -bios $(OVMF) -rtc base=localtime -drive format=raw,file=$(IMG)
 
 clean: ## Remove generated files
 	@rm -rf $(BUILD)
@@ -52,12 +51,16 @@ clean: ## Remove generated files
 # Build rules
 # =================================================
 
-$(OBJ): $(SOURCES) $(INCLUDES)
+$(BUILD)/main.obj: $(SRC_DIR)/main.asm $(INCLUDES)
 	@mkdir -p $(BUILD)
-	$(ASM) $(ASMFLAGS) -I$(SRC_DIR)/ $(SOURCES) -o $@
+	$(ASM) $(ASMFLAGS) -I$(SRC_DIR)/ $(SRC_DIR)/main.asm -o $@
+
+$(BUILD)/clock.obj: $(SRC_DIR)/clock.asm $(INCLUDES)
+	@mkdir -p $(BUILD)
+	$(ASM) $(ASMFLAGS) -I$(SRC_DIR)/ $(SRC_DIR)/clock.asm -o $@
 
 $(EFI): $(OBJ)
-	$(LD) $(LDFLAGS) $< /out:$@
+	$(LD) $(LDFLAGS) $^ /out:$@
 
 # FAT32 EFI System Partition built with mtools (no root or loop mount needed).
 # mkfs.vfat usually lives in /usr/sbin, which may be absent from a non-login PATH.
