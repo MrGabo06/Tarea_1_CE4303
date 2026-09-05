@@ -1,4 +1,5 @@
 ; =============================================================================
+;
 ; clock.asm - UEFI x86-64
 ;
 ; Obtains the current time using UEFI Runtime Services -> GetTime()
@@ -6,6 +7,8 @@
 ;
 ; The clock is updated once per second using Boot Services -> Stall().
 ; The cursor is repositioned before each update so the same line is reused.
+;
+; Pressing the DOWN arrow switches between clock mode and stopwatch mode.
 ;
 ; NASM:
 ;     nasm -f win64 clock.asm -o clock.obj
@@ -21,152 +24,91 @@
 ; =============================================================================
 
 default rel
-
 bits 64
 
 %include "uefi.inc"
 
 global clock_main
 
-
-; =============================================================================
-; DATA
-; =============================================================================
-
 section .data
-
-
-; -----------------------------------------------------------------------------
-; Pointer to EFI_SYSTEM_TABLE
-; -----------------------------------------------------------------------------
 
 SystemTable:
     dq 0
 
-
-; -----------------------------------------------------------------------------
-; EFI_TIME structure
-;
-; Offset:
-;     0  = Year        UINT16
-;     2  = Month       UINT8
-;     3  = Day         UINT8
-;     4  = Hour        UINT8
-;     5  = Minute      UINT8
-;     6  = Second      UINT8
-; -----------------------------------------------------------------------------
-
 Time:
     times 16 db 0
 
+KeyBuf:
+    times 4 db 0
 
-; -----------------------------------------------------------------------------
-; Final string:
-;
-;     HH:MM:SS\0
-;
-; Each character is stored as UTF-16 for UEFI OutputString().
-; -----------------------------------------------------------------------------
+CurrentMode:
+    db 0
+
+StopwatchRunning:
+    db 0
+
+StopwatchTicks:
+    db 0
 
 TimeString:
     dw '0', '0', ':', '0', '0', ':', '0', '0', 0
 
-
-; =============================================================================
-; CODE
-; =============================================================================
-
 section .text
 
-
-; =============================================================================
-; clock_main
-;
-; Input:
-;     RCX = EFI_SYSTEM_TABLE*
-;
-; Return:
-;     RAX = EFI_STATUS
-; =============================================================================
-
 clock_main:
-
-
-; -----------------------------------------------------------------------------
-; PROLOGUE
-; -----------------------------------------------------------------------------
 
     push    rbp
     mov     rbp, rsp
     sub     rsp, 32
 
-
-; -----------------------------------------------------------------------------
-; Save EFI_SYSTEM_TABLE*
-; -----------------------------------------------------------------------------
-
     mov     [SystemTable], rcx
+    mov     byte [CurrentMode], 0
+    mov     byte [StopwatchRunning], 0
+
+clock_loop:
+
+    call    read_key
+
+    cmp     eax, 2
+    je      enter_stopwatch
+
+    jmp     clock_continue
+
+enter_stopwatch:
 
 
-; =============================================================================
-; CLOCK LOOP
-; =============================================================================
+    mov     byte [CurrentMode], 1
+    mov     byte [StopwatchRunning], 0
 
-.loop:
+    mov     word [TimeString + 0], '0'
+    mov     word [TimeString + 2], '0'
+    mov     word [TimeString + 4], ':'
+    mov     word [TimeString + 6], '0'
+    mov     word [TimeString + 8], '0'
+    mov     word [TimeString + 10], ':'
+    mov     word [TimeString + 12], '0'
+    mov     word [TimeString + 14], '0'
 
+    jmp     stopwatch_loop
 
-; -----------------------------------------------------------------------------
-; Get EFI_RUNTIME_SERVICES*
-; -----------------------------------------------------------------------------
+clock_continue:
 
     mov     rcx, [SystemTable]
     mov     rax, [rcx + ST_RuntimeServices]
 
-
-; -----------------------------------------------------------------------------
-; GetTime()
-;
-; EFI_STATUS GetTime(
-;     EFI_TIME *Time,
-;     EFI_TIME_CAPABILITIES *Capabilities
-; );
-;
-; RCX = &Time
-; RDX = NULL
-; -----------------------------------------------------------------------------
-
     lea     rcx, [Time]
     xor     rdx, rdx
+
     call    [rax + RT_GetTime]
 
-
-; -----------------------------------------------------------------------------
-; Check EFI_STATUS
-;
-; EFI_SUCCESS = 0
-; -----------------------------------------------------------------------------
-
     test    rax, rax
-    jnz     .return
-
-
-; -----------------------------------------------------------------------------
-; FORMAT HOURS
-;
-; EFI_TIME.Hour = 0-23
-;
-; Example:
-;     19 / 10 = 1
-;     19 % 10 = 9
-; -----------------------------------------------------------------------------
+    jnz     clock_return
 
     movzx   eax, byte [Time + TIME_Hour]
+
     xor     edx, edx
     mov     ecx, 10
     div     ecx
-
-; EAX = tens
-; EDX = units
 
     add     eax, '0'
     mov     [TimeString + 0], ax
@@ -175,18 +117,11 @@ clock_main:
     add     eax, '0'
     mov     [TimeString + 2], ax
 
-
-; -----------------------------------------------------------------------------
-; FORMAT MINUTES
-; -----------------------------------------------------------------------------
-
     movzx   eax, byte [Time + TIME_Minute]
+
     xor     edx, edx
     mov     ecx, 10
     div     ecx
-
-; EAX = tens
-; EDX = units
 
     add     eax, '0'
     mov     [TimeString + 6], ax
@@ -195,18 +130,11 @@ clock_main:
     add     eax, '0'
     mov     [TimeString + 8], ax
 
-
-; -----------------------------------------------------------------------------
-; FORMAT SECONDS
-; -----------------------------------------------------------------------------
-
     movzx   eax, byte [Time + TIME_Second]
+
     xor     edx, edx
     mov     ecx, 10
     div     ecx
-
-; EAX = tens
-; EDX = units
 
     add     eax, '0'
     mov     [TimeString + 12], ax
@@ -215,54 +143,17 @@ clock_main:
     add     eax, '0'
     mov     [TimeString + 14], ax
 
-
-; =============================================================================
-; POSITION CURSOR
-; =============================================================================
-
-; -----------------------------------------------------------------------------
-; Get EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL*
-; -----------------------------------------------------------------------------
-
     mov     rcx, [SystemTable]
     mov     rcx, [rcx + ST_ConOut]
-
-
-; -----------------------------------------------------------------------------
-; Set cursor position
-;
-; SetCursorPosition(
-;     ConOut,
-;     Column,
-;     Row
-; );
-;
-; RCX = ConOut
-; RDX = Column = 0
-; R8  = Row    = 0
-; -----------------------------------------------------------------------------
 
     xor     rdx, rdx
     xor     r8, r8
 
     call    [rcx + OUT_SetCursorPosition]
 
-
-; =============================================================================
-; PRINT TIME
-; =============================================================================
-
-; -----------------------------------------------------------------------------
-; Print HH:MM:SS
-; -----------------------------------------------------------------------------
-
     lea     rcx, [TimeString]
+
     call    print_string
-
-
-; =============================================================================
-; WAIT ONE SECOND
-; =============================================================================
 
     mov     rcx, [SystemTable]
     mov     rcx, [rcx + ST_BootServices]
@@ -270,21 +161,175 @@ clock_main:
     mov     rax, [rcx + BS_Stall]
 
     mov     rcx, 1000000
+
     call    rax
 
-
-; -----------------------------------------------------------------------------
-; Repeat the clock loop
-; -----------------------------------------------------------------------------
-
-    jmp     .loop
+    jmp     clock_loop
 
 
-; =============================================================================
-; RETURN
-; =============================================================================
+stopwatch_loop:
 
-.return:
+    mov     rcx, [SystemTable]
+    mov     rcx, [rcx + ST_ConOut]
+
+    xor     rdx, rdx
+    xor     r8, r8
+
+    call    [rcx + OUT_SetCursorPosition]
+
+    lea     rcx, [TimeString]
+
+    call    print_string
+
+    call    read_key
+
+    cmp     eax, 1
+    je      stopwatch_space
+
+    cmp     eax, 2
+    je      stopwatch_down
+
+    cmp     eax, 3
+    je      stopwatch_reset
+
+    jmp     stopwatch_wait
+
+
+stopwatch_space:
+
+    xor     byte [StopwatchRunning], 1
+
+    jmp     stopwatch_wait
+
+
+stopwatch_down:
+
+    mov     byte [CurrentMode], 0
+    mov     byte [StopwatchRunning], 0
+
+    jmp     clock_loop
+
+stopwatch_reset:
+
+    mov     byte [StopwatchRunning], 0
+    mov     byte [StopwatchTicks], 0
+
+    mov     word [TimeString + 0], '0'
+    mov     word [TimeString + 2], '0'
+    mov     word [TimeString + 4], ':'
+    mov     word [TimeString + 6], '0'
+    mov     word [TimeString + 8], '0'
+    mov     word [TimeString + 10], ':'
+    mov     word [TimeString + 12], '0'
+    mov     word [TimeString + 14], '0'
+
+    jmp     stopwatch_wait
+
+stopwatch_wait:
+
+    mov     rcx, [SystemTable]
+    mov     rcx, [rcx + ST_BootServices]
+    mov     rax, [rcx + BS_Stall]
+
+    mov     rcx, 100000
+    call    rax
+
+    cmp     byte [StopwatchRunning], 1
+    jne     stopwatch_loop
+
+    inc     byte [StopwatchTicks]
+
+    cmp     byte [StopwatchTicks], 10
+    jne     stopwatch_loop
+
+    mov     byte [StopwatchTicks], 0
+
+    inc     byte [TimeString + 14]
+
+    cmp     byte [TimeString + 14], '9' + 1
+    jne     stopwatch_loop
+
+    mov     byte [TimeString + 14], '0'
+
+    inc     byte [TimeString + 12]
+
+    cmp     byte [TimeString + 12], '6'
+    jne     stopwatch_loop
+
+    mov     byte [TimeString + 12], '0'
+
+    inc     byte [TimeString + 8]
+
+    cmp     byte [TimeString + 8], '9' + 1
+    jne     stopwatch_loop
+
+    mov     byte [TimeString + 8], '0'
+
+    inc     byte [TimeString + 6]
+
+    cmp     byte [TimeString + 6], '6'
+    jne     stopwatch_loop
+
+    mov     byte [TimeString + 6], '0'
+
+    inc     byte [TimeString + 2]
+
+    cmp     byte [TimeString + 2], '9' + 1
+    jne     stopwatch_loop
+
+    mov     byte [TimeString + 2], '0'
+
+    inc     byte [TimeString + 0]
+
+    jmp     stopwatch_loop
+
+
+read_key:
+
+    mov     rcx, [SystemTable]
+    mov     rcx, [rcx + ST_ConIn]
+
+    lea     rdx, [KeyBuf]
+
+    call    [rcx + IN_ReadKeyStroke]
+
+    test    rax, rax
+    jnz     no_key
+
+    cmp     word [KeyBuf + 2], ' '
+    je      key_space
+
+    cmp     word [KeyBuf], 2
+    je      key_down
+
+    cmp     word [KeyBuf + 2], 'r'
+    je      key_r
+
+    cmp     word [KeyBuf + 2], 'R'
+    je      key_r
+
+no_key:
+
+    xor     eax, eax
+    ret
+
+key_space:
+
+    mov     eax, 1
+    ret
+
+key_down:
+
+    mov     eax, 2
+    ret
+
+key_r:
+
+    mov     eax, 3
+    ret
+
+
+clock_return:
 
     add     rsp, 32
     pop     rbp
@@ -293,44 +338,18 @@ clock_main:
 
 print_string:
 
-
-; -----------------------------------------------------------------------------
-; PROLOGUE
-; -----------------------------------------------------------------------------
-
     push    rbp
     mov     rbp, rsp
     sub     rsp, 32
 
-
-; -----------------------------------------------------------------------------
-; RDX = String
-; -----------------------------------------------------------------------------
-
     mov     rdx, rcx
 
-
-; -----------------------------------------------------------------------------
-; RCX = EFI_SYSTEM_TABLE*
-; -----------------------------------------------------------------------------
-
     mov     rcx, [SystemTable]
-
-
-; -----------------------------------------------------------------------------
-; RCX = ConOut
-; -----------------------------------------------------------------------------
-
     mov     rcx, [rcx + ST_ConOut]
-
-
-; -----------------------------------------------------------------------------
-; OutputString(ConOut, String)
-; -----------------------------------------------------------------------------
 
     call    [rcx + OUT_OutputString]
 
-
     add     rsp, 32
     pop     rbp
+
     ret
