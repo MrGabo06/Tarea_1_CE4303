@@ -50,8 +50,23 @@ StopwatchRunning:
 StopwatchTicks:
     db 0
 
+AlarmField:
+    db 0
+
+AlarmTime:
+    times 16 db 0
+
+AlarmActive:
+    db 0
+
+AlarmTriggered:
+    db 0
+
 TimeString:
     dw '0', '0', ':', '0', '0', ':', '0', '0', 0
+
+AlarmMessage:
+    dw 'A','L','A','R','M','A',0
 
 section .text
 
@@ -70,7 +85,7 @@ clock_loop:
 
     call    read_key
 
-    cmp     eax, 2
+    cmp     eax, 8
     je      enter_stopwatch
 
     jmp     clock_continue
@@ -91,8 +106,11 @@ enter_stopwatch:
     mov     word [TimeString + 14], '0'
 
     jmp     stopwatch_loop
-
 clock_continue:
+
+    ; -------------------------------------------------------------------------
+    ; Get current RTC time
+    ; -------------------------------------------------------------------------
 
     mov     rcx, [SystemTable]
     mov     rax, [rcx + ST_RuntimeServices]
@@ -105,7 +123,13 @@ clock_continue:
     test    rax, rax
     jnz     clock_return
 
+
+    ; -------------------------------------------------------------------------
+    ; Convert hours to HH
+    ; -------------------------------------------------------------------------
+
     movzx   eax, byte [Time + TIME_Hour]
+
     xor     edx, edx
     mov     ecx, 10
     div     ecx
@@ -117,7 +141,13 @@ clock_continue:
     add     eax, '0'
     mov     [TimeString + 2], ax
 
+
+    ; -------------------------------------------------------------------------
+    ; Convert minutes to MM
+    ; -------------------------------------------------------------------------
+
     movzx   eax, byte [Time + TIME_Minute]
+
     xor     edx, edx
     mov     ecx, 10
     div     ecx
@@ -129,7 +159,13 @@ clock_continue:
     add     eax, '0'
     mov     [TimeString + 8], ax
 
+
+    ; -------------------------------------------------------------------------
+    ; Convert seconds to SS
+    ; -------------------------------------------------------------------------
+
     movzx   eax, byte [Time + TIME_Second]
+
     xor     edx, edx
     mov     ecx, 10
     div     ecx
@@ -140,6 +176,18 @@ clock_continue:
     mov     eax, edx
     add     eax, '0'
     mov     [TimeString + 14], ax
+
+
+    ; -------------------------------------------------------------------------
+    ; Check alarm
+    ; -------------------------------------------------------------------------
+
+    call    check_alarm
+
+
+    ; -------------------------------------------------------------------------
+    ; Display current time
+    ; -------------------------------------------------------------------------
 
     mov     rcx, [SystemTable]
     mov     rcx, [rcx + ST_ConOut]
@@ -152,10 +200,37 @@ clock_continue:
     lea     rcx, [TimeString]
     call    print_string
 
+
+    ; -------------------------------------------------------------------------
+    ; Display ALARMA if triggered
+    ; -------------------------------------------------------------------------
+
+    cmp     byte [AlarmTriggered], 1
+    jne     .no_alarm
+
+    mov     rcx, [SystemTable]
+    mov     rcx, [rcx + ST_ConOut]
+
+    xor     rdx, rdx
+    mov     r8, 1
+
+    call    [rcx + OUT_SetCursorPosition]
+
+    lea     rcx, [AlarmMessage]
+    call    print_string
+
+.no_alarm:
+
+
+    ; -------------------------------------------------------------------------
+    ; Wait 1 second
+    ; -------------------------------------------------------------------------
+
     mov     rcx, [SystemTable]
     mov     rcx, [rcx + ST_BootServices]
 
     mov     rax, [rcx + BS_Stall]
+
     mov     rcx, 1000000
 
     call    rax
@@ -171,10 +246,8 @@ stopwatch_loop:
 
     mov     rcx, [SystemTable]
     mov     rcx, [rcx + ST_ConOut]
-
     xor     rdx, rdx
     xor     r8, r8
-
     call    [rcx + OUT_SetCursorPosition]
 
     lea     rcx, [TimeString]
@@ -185,7 +258,7 @@ stopwatch_loop:
     cmp     eax, 1
     je      stopwatch_space
 
-    cmp     eax, 2
+    cmp     eax, 8
     je      stopwatch_down
 
     cmp     eax, 3
@@ -283,8 +356,9 @@ stopwatch_wait:
 ; =============================================================================
 ; ALARM MODE
 ; =============================================================================
-
 enter_alarm:
+
+    mov     byte [AlarmField], 0
 
     mov     rcx, [SystemTable]
     mov     rax, [rcx + ST_RuntimeServices]
@@ -334,7 +408,6 @@ enter_alarm:
     mov     [TimeString + 14], ax
 
     jmp     alarm_loop
-
 alarm_loop:
 
     mov     rcx, [SystemTable]
@@ -350,14 +423,226 @@ alarm_loop:
 
     call    read_key
 
-    cmp     eax, 2
+    cmp     eax, 4
+    je      alarm_left
+
+    cmp     eax, 5
+    je      alarm_right
+
+    cmp     eax, 6
+    je      alarm_up
+
+    cmp     eax, 7
     je      alarm_down
+
+    cmp     eax, 8
+    je      alarm_exit
+
+    cmp     eax, 9
+    je      alarm_set
+
+    jmp     alarm_loop
+
+alarm_set:
+
+    ; Copiar hora configurada a AlarmTime
+    mov     rsi, TimeString
+    mov     rdi, AlarmTime
+    mov     rcx, 16
+
+    rep     movsb
+
+    ; Activar alarma
+    mov     byte [AlarmActive], 1
+    mov     byte [AlarmTriggered], 0
+
+    ; Volver al reloj
+    jmp     clock_loop
+
+alarm_left:
+
+    cmp     byte [AlarmField], 0
+    je      alarm_loop
+
+    dec     byte [AlarmField]
+    jmp     alarm_loop
+
+
+alarm_right:
+
+    cmp     byte [AlarmField], 2
+    je      alarm_loop
+
+    inc     byte [AlarmField]
+    jmp     alarm_loop
+
+alarm_up:
+
+    cmp     byte [AlarmField], 0
+    je      alarm_up_hours
+
+    cmp     byte [AlarmField], 1
+    je      alarm_up_minutes
+
+    jmp     alarm_up_seconds
+
+
+alarm_up_hours:
+
+    inc     byte [TimeString + 2]
+
+    cmp     byte [TimeString + 2], '9' + 1
+    jne     alarm_loop
+
+    mov     byte [TimeString + 2], '0'
+
+    inc     byte [TimeString + 0]
+
+    cmp     byte [TimeString + 0], '2' + 1
+    jne     alarm_loop
+
+    mov     byte [TimeString + 0], '0'
 
     jmp     alarm_loop
 
 
+alarm_up_minutes:
+
+    inc     byte [TimeString + 8]
+
+    cmp     byte [TimeString + 8], '9' + 1
+    jne     alarm_loop
+
+    mov     byte [TimeString + 8], '0'
+
+    inc     byte [TimeString + 6]
+
+    cmp     byte [TimeString + 6], '6'
+    jne     alarm_loop
+
+    mov     byte [TimeString + 6], '0'
+
+    jmp     alarm_loop
+
+
+alarm_up_seconds:
+
+    inc     byte [TimeString + 14]
+
+    cmp     byte [TimeString + 14], '9' + 1
+    jne     alarm_loop
+
+    mov     byte [TimeString + 14], '0'
+
+    inc     byte [TimeString + 12]
+
+    cmp     byte [TimeString + 12], '6'
+    jne     alarm_loop
+
+    mov     byte [TimeString + 12], '0'
+
+    jmp     alarm_loop
+
 
 alarm_down:
+
+    cmp     byte [AlarmField], 0
+    je      alarm_down_hours
+
+    cmp     byte [AlarmField], 1
+    je      alarm_down_minutes
+
+    jmp     alarm_down_seconds
+
+
+alarm_down_hours:
+
+    cmp     byte [TimeString + 0], '0'
+    jne     alarm_down_hours_normal
+
+    cmp     byte [TimeString + 2], '0'
+    jne     alarm_down_hours_borrow
+
+    mov     byte [TimeString + 0], '2'
+    mov     byte [TimeString + 2], '3'
+    jmp     alarm_loop
+
+
+alarm_down_hours_borrow:
+
+    dec     byte [TimeString + 0]
+    mov     byte [TimeString + 2], '9'
+    jmp     alarm_loop
+
+
+alarm_down_hours_normal:
+
+    cmp     byte [TimeString + 2], '0'
+    jne     alarm_down_hours_normal_dec
+
+    dec     byte [TimeString + 0]
+    mov     byte [TimeString + 2], '9'
+    jmp     alarm_loop
+
+
+alarm_down_hours_normal_dec:
+
+    dec     byte [TimeString + 2]
+    jmp     alarm_loop
+
+
+alarm_down_minutes:
+
+    cmp     byte [TimeString + 6], '0'
+    jne     alarm_down_minutes_normal
+
+    mov     byte [TimeString + 6], '5'
+    mov     byte [TimeString + 8], '9'
+    jmp     alarm_loop
+
+
+alarm_down_minutes_normal:
+
+    cmp     byte [TimeString + 8], '0'
+    jne     alarm_down_minutes_normal_dec
+
+    dec     byte [TimeString + 6]
+    mov     byte [TimeString + 8], '9'
+    jmp     alarm_loop
+
+
+alarm_down_minutes_normal_dec:
+
+    dec     byte [TimeString + 8]
+    jmp     alarm_loop
+
+
+alarm_down_seconds:
+
+    cmp     byte [TimeString + 12], '0'
+    jne     alarm_down_seconds_normal
+
+    mov     byte [TimeString + 12], '5'
+    mov     byte [TimeString + 14], '9'
+    jmp     alarm_loop
+
+
+alarm_down_seconds_normal:
+
+    cmp     byte [TimeString + 14], '0'
+    jne     alarm_down_seconds_normal_dec
+
+    dec     byte [TimeString + 12]
+    mov     byte [TimeString + 14], '9'
+    jmp     alarm_loop
+
+
+alarm_down_seconds_normal_dec:
+
+    dec     byte [TimeString + 14]
+    jmp     alarm_loop
+
+alarm_exit:
 
     mov     byte [CurrentMode], 0
     mov     byte [StopwatchRunning], 0
@@ -369,7 +654,6 @@ alarm_down:
 ; =============================================================================
 ; KEYBOARD
 ; =============================================================================
-
 read_key:
 
     mov     rcx, [SystemTable]
@@ -381,6 +665,18 @@ read_key:
 
     test    rax, rax
     jnz     no_key
+
+    cmp     word [KeyBuf], 1
+    je      key_up
+
+    cmp     word [KeyBuf], 2
+    je      key_down
+
+    cmp     word [KeyBuf], 3
+    je      key_right
+
+    cmp     word [KeyBuf], 4
+    je      key_left
 
     cmp     word [KeyBuf + 2], ' '
     je      key_space
@@ -394,10 +690,36 @@ read_key:
     cmp     word [KeyBuf + 2], 'R'
     je      key_r
 
+    cmp     word [KeyBuf + 2], 13
+    je      key_enter
 
 no_key:
 
     xor     eax, eax
+    ret
+
+
+key_up:
+
+    mov     eax, 6
+    ret
+
+
+key_down:
+
+    mov     eax, 7
+    ret
+
+
+key_right:
+
+    mov     eax, 5
+    ret
+
+
+key_left:
+
+    mov     eax, 4
     ret
 
 
@@ -409,7 +731,7 @@ key_space:
 
 key_m:
 
-    mov     eax, 2
+    mov     eax, 8
     ret
 
 
@@ -418,7 +740,46 @@ key_r:
     mov     eax, 3
     ret
 
+key_enter:
+    mov     eax, 9
+    ret
 
+check_alarm:
+
+    cmp     byte [AlarmActive], 1
+    jne     .done
+
+    cmp     byte [AlarmTriggered], 1
+    je      .done
+
+    mov     al, [TimeString + 0]
+    cmp     al, [AlarmTime + 0]
+    jne     .done
+
+    mov     al, [TimeString + 2]
+    cmp     al, [AlarmTime + 2]
+    jne     .done
+
+    mov     al, [TimeString + 6]
+    cmp     al, [AlarmTime + 6]
+    jne     .done
+
+    mov     al, [TimeString + 8]
+    cmp     al, [AlarmTime + 8]
+    jne     .done
+
+    mov     al, [TimeString + 12]
+    cmp     al, [AlarmTime + 12]
+    jne     .done
+
+    mov     al, [TimeString + 14]
+    cmp     al, [AlarmTime + 14]
+    jne     .done
+
+    mov     byte [AlarmTriggered], 1
+
+.done:
+    ret
 ; =============================================================================
 ; RETURN
 ; =============================================================================
