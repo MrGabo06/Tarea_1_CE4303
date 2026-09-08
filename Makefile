@@ -1,44 +1,71 @@
 # =================================================
-# Configuration
+# Configuration: UEFI x86_64 application
 # =================================================
 
-ASM := nasm
-LD  := ld
+ASM      := nasm
+LD       := lld-link
+ASMFLAGS := -f win64
 
-ASMFLAGS := -f elf64
+# PE32+ EFI application: firmware jumps to efi_main; no C runtime.
+LDFLAGS  := /subsystem:efi_application /entry:efi_main /nodefaultlib
 
-SOURCES := $(shell find . -type f -name "*.asm")
-TARGETS := $(SOURCES:.asm=)
+# OVMF firmware for QEMU. Override on the command line if your path differs:
+#   make run OVMF=/usr/share/OVMF/OVMF_CODE_4M.fd
+OVMF     ?= /usr/share/ovmf/OVMF.fd
+
+SRC_DIR  := src
+BUILD    := build
+OBJ      := $(BUILD)/main.obj $(BUILD)/clock.obj
+EFI      := $(BUILD)/BOOTX64.EFI
+IMG      := $(BUILD)/esp.img
+
+SOURCES  := $(SRC_DIR)/main.asm
+INCLUDES := $(SRC_DIR)/uefi.inc
 
 
 # =================================================
 # Targets
-# NOTE: When adding rules, add what it does after
-# target: requisites preceeded by ## so targets
-# remain automatically documented
 # =================================================
 
-.PHONY: all help build clean
+.PHONY: all help build image run clean
 
 all: help
 
 help: ## Show available targets
 	@echo "Available targets:"
-	@grep -E '^[a-zA-Z0-9_%./-]+:.*?## ' $(MAKEFILE_LIST) | \
-	awk 'BEGIN {FS = ":.*?## "}; {printf "  %-20s %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z0-9_%./-]+:.*## ' $(MAKEFILE_LIST) | \
+	awk 'BEGIN {FS = ":.*## "}; {printf "  %-20s %s\n", $$1, $$2}'
 
-build: $(TARGETS) ## Build all ASM files
+build: $(EFI) ## Assemble and link the UEFI application (build/BOOTX64.EFI)
+
+image: $(IMG) ## Build a FAT32 EFI System Partition image with the app at /EFI/BOOT
+
+run: $(IMG) ## Build image and boot it in QEMU with OVMF
+	qemu-system-x86_64 -bios $(OVMF) -rtc base=localtime -drive format=raw,file=$(IMG)
 
 clean: ## Remove generated files
-	@rm -f $(TARGETS)
-	@find . -type f -name "*.o" -delete
+	@rm -rf $(BUILD)
 
 
 # =================================================
-# Generic ASM rule
+# Build rules
 # =================================================
 
-%: %.asm
-	$(ASM) $(ASMFLAGS) $< -o $@.o
-	$(LD) $@.o -o $@
-	@rm -f $@.o
+$(BUILD)/main.obj: $(SRC_DIR)/main.asm $(INCLUDES)
+	@mkdir -p $(BUILD)
+	$(ASM) $(ASMFLAGS) -I$(SRC_DIR)/ $(SRC_DIR)/main.asm -o $@
+
+$(BUILD)/clock.obj: $(SRC_DIR)/clock.asm $(INCLUDES)
+	@mkdir -p $(BUILD)
+	$(ASM) $(ASMFLAGS) -I$(SRC_DIR)/ $(SRC_DIR)/clock.asm -o $@
+
+$(EFI): $(OBJ)
+	$(LD) $(LDFLAGS) $^ /out:$@
+
+# FAT32 EFI System Partition built with mtools (no root or loop mount needed).
+# mkfs.vfat usually lives in /usr/sbin, which may be absent from a non-login PATH.
+$(IMG): $(EFI)
+	dd if=/dev/zero of=$@ bs=1M count=64
+	PATH="$$PATH:/usr/sbin:/sbin" mkfs.vfat $@
+	mmd   -i $@ ::/EFI ::/EFI/BOOT
+	mcopy -i $@ $(EFI) ::/EFI/BOOT/BOOTX64.EFI
