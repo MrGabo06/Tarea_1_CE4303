@@ -66,3 +66,11 @@
 ; --- Common EFI_STATUS values (high bit set = error) ---
 %define EFI_SUCCESS             0
 %define EFI_NOT_READY           0x8000000000000006
+
+; --- EFI_INPUT_KEY scan codes and control characters ---
+%define SCAN_UP                 0x01
+%define SCAN_DOWN               0x02
+%define SCAN_RIGHT              0x03
+%define SCAN_LEFT               0x04
+%define SCAN_ESC                0x17
+%define CHAR_CARRIAGE_RETURN    0x0D

@@ -1,24 +1,40 @@
 ; =============================================================================
-;*
 ; clock.asm - UEFI x86-64
-;*
+;
 ; Obtains the current time using UEFI Runtime Services -> GetTime()
 ; and displays the time in HH:MM:SS format.
-;*
+;
 ; The clock is updated once per second using Boot Services -> Stall().
 ; The cursor is repositioned before each update so the same line is reused.
-;*
-; Pressing the DOWN arrow cycles between clock, stopwatch and alarm modes.
-;*
+;
+; Keys:
+;     m       cycle between clock, stopwatch and alarm modes
+;     space   start / pause / resume the stopwatch
+;     r       reset the stopwatch
+;     left    select the previous field (alarm mode)
+;     right   select the next field (alarm mode)
+;     up      increment the selected field (alarm mode)
+;     down    decrement the selected field (alarm mode)
+;     enter   set the alarm and return to the clock
+;     esc     leave clock_main and go back to the startup screen (any mode)
+;
+; The alarm is checked in every mode. When it fires, "ALARM" blinks on the
+; line below the time until a new alarm is set.
+;
 ; NASM:
 ;     nasm -f win64 clock.asm -o clock.obj
-;*
+;
 ; Calling convention:
 ;     Microsoft x64
-;*
+;
+; Every routine that calls a firmware service owns a frame (push rbp /
+; sub rsp, 32) so the callee gets its 32-byte shadow space and a 16-byte
+; aligned stack. Sharing the caller's shadow space corrupts the return
+; address on real firmware.
+;
 ; Entry point:
 ;     RCX = EFI_SYSTEM_TABLE*
-;*
+;
 ; Return:
 ;     RAX = EFI_STATUS
 ; =============================================================================
@@ -62,11 +78,16 @@ AlarmActive:
 AlarmTriggered:
     db 0
 
+; Current wall-clock time, refreshed by read_clock in every mode
+ClockString:
+    dw '0', '0', ':', '0', '0', ':', '0', '0', 0
+
+; Text shown on screen: the stopwatch counter or the alarm being edited
 TimeString:
     dw '0', '0', ':', '0', '0', ':', '0', '0', 0
 
 AlarmMessage:
-    dw 'A','L','A','R','M','A',0
+    dw 'A', 'L', 'A', 'R', 'M', 0
 
 section .text
 
@@ -76,14 +97,22 @@ clock_main:
     mov     rbp, rsp
     sub     rsp, 32
 
+    ; Fresh state on every entry, so returning from the startup screen
+    ; restarts the program instead of resuming the previous session.
+
     mov     [SystemTable], rcx
     mov     byte [CurrentMode], 0
     mov     byte [StopwatchRunning], 0
     mov     byte [StopwatchTicks], 0
+    mov     byte [AlarmActive], 0
+    mov     byte [AlarmTriggered], 0
 
 clock_loop:
 
     call    read_key
+
+    cmp     eax, 10
+    je      clock_escape
 
     cmp     eax, 8
     je      enter_stopwatch
@@ -106,76 +135,17 @@ enter_stopwatch:
     mov     word [TimeString + 14], '0'
 
     jmp     stopwatch_loop
+
 clock_continue:
 
     ; -------------------------------------------------------------------------
-    ; Get current RTC time
+    ; Get current RTC time into ClockString
     ; -------------------------------------------------------------------------
 
-    mov     rcx, [SystemTable]
-    mov     rax, [rcx + ST_RuntimeServices]
-
-    lea     rcx, [Time]
-    xor     rdx, rdx
-
-    call    [rax + RT_GetTime]
+    call    read_clock
 
     test    rax, rax
     jnz     clock_return
-
-
-    ; -------------------------------------------------------------------------
-    ; Convert hours to HH
-    ; -------------------------------------------------------------------------
-
-    movzx   eax, byte [Time + TIME_Hour]
-
-    xor     edx, edx
-    mov     ecx, 10
-    div     ecx
-
-    add     eax, '0'
-    mov     [TimeString + 0], ax
-
-    mov     eax, edx
-    add     eax, '0'
-    mov     [TimeString + 2], ax
-
-
-    ; -------------------------------------------------------------------------
-    ; Convert minutes to MM
-    ; -------------------------------------------------------------------------
-
-    movzx   eax, byte [Time + TIME_Minute]
-
-    xor     edx, edx
-    mov     ecx, 10
-    div     ecx
-
-    add     eax, '0'
-    mov     [TimeString + 6], ax
-
-    mov     eax, edx
-    add     eax, '0'
-    mov     [TimeString + 8], ax
-
-
-    ; -------------------------------------------------------------------------
-    ; Convert seconds to SS
-    ; -------------------------------------------------------------------------
-
-    movzx   eax, byte [Time + TIME_Second]
-
-    xor     edx, edx
-    mov     ecx, 10
-    div     ecx
-
-    add     eax, '0'
-    mov     [TimeString + 12], ax
-
-    mov     eax, edx
-    add     eax, '0'
-    mov     [TimeString + 14], ax
 
 
     ; -------------------------------------------------------------------------
@@ -197,29 +167,10 @@ clock_continue:
 
     call    [rcx + OUT_SetCursorPosition]
 
-    lea     rcx, [TimeString]
+    lea     rcx, [ClockString]
     call    print_string
 
-
-    ; -------------------------------------------------------------------------
-    ; Display ALARMA if triggered
-    ; -------------------------------------------------------------------------
-
-    cmp     byte [AlarmTriggered], 1
-    jne     .no_alarm
-
-    mov     rcx, [SystemTable]
-    mov     rcx, [rcx + ST_ConOut]
-
-    xor     rdx, rdx
-    mov     r8, 1
-
-    call    [rcx + OUT_SetCursorPosition]
-
-    lea     rcx, [AlarmMessage]
-    call    print_string
-
-.no_alarm:
+    call    show_alarm
 
 
     ; -------------------------------------------------------------------------
@@ -253,7 +204,14 @@ stopwatch_loop:
     lea     rcx, [TimeString]
     call    print_string
 
+    call    read_clock
+    call    check_alarm
+    call    show_alarm
+
     call    read_key
+
+    cmp     eax, 10
+    je      clock_escape
 
     cmp     eax, 1
     je      stopwatch_space
@@ -360,54 +318,19 @@ enter_alarm:
 
     mov     byte [AlarmField], 0
 
-    mov     rcx, [SystemTable]
-    mov     rax, [rcx + ST_RuntimeServices]
+    ; Prefill the editable time with the current clock
 
-    lea     rcx, [Time]
-    xor     rdx, rdx
-
-    call    [rax + RT_GetTime]
+    call    read_clock
 
     test    rax, rax
     jnz     clock_return
 
-    movzx   eax, byte [Time + TIME_Hour]
-    xor     edx, edx
-    mov     ecx, 10
-    div     ecx
+    mov     rax, [ClockString + 0]
+    mov     [TimeString + 0], rax
 
-    add     eax, '0'
-    mov     [TimeString + 0], ax
+    mov     rax, [ClockString + 8]
+    mov     [TimeString + 8], rax
 
-    mov     eax, edx
-    add     eax, '0'
-    mov     [TimeString + 2], ax
-
-    movzx   eax, byte [Time + TIME_Minute]
-    xor     edx, edx
-    mov     ecx, 10
-    div     ecx
-
-    add     eax, '0'
-    mov     [TimeString + 6], ax
-
-    mov     eax, edx
-    add     eax, '0'
-    mov     [TimeString + 8], ax
-
-    movzx   eax, byte [Time + TIME_Second]
-    xor     edx, edx
-    mov     ecx, 10
-    div     ecx
-
-    add     eax, '0'
-    mov     [TimeString + 12], ax
-
-    mov     eax, edx
-    add     eax, '0'
-    mov     [TimeString + 14], ax
-
-    jmp     alarm_loop
 alarm_loop:
 
     mov     rcx, [SystemTable]
@@ -421,7 +344,14 @@ alarm_loop:
     lea     rcx, [TimeString]
     call    print_string
 
+    call    read_clock
+    call    check_alarm
+    call    show_alarm
+
     call    read_key
+
+    cmp     eax, 10
+    je      clock_escape
 
     cmp     eax, 4
     je      alarm_left
@@ -445,18 +375,23 @@ alarm_loop:
 
 alarm_set:
 
-    ; Copiar hora configurada a AlarmTime
-    mov     rsi, TimeString
-    mov     rdi, AlarmTime
-    mov     rcx, 16
+    ; Copy the edited time into AlarmTime (16 bytes, two qwords)
 
-    rep     movsb
+    mov     rax, [TimeString + 0]
+    mov     [AlarmTime + 0], rax
 
-    ; Activar alarma
+    mov     rax, [TimeString + 8]
+    mov     [AlarmTime + 8], rax
+
+    ; Arm the alarm
+
     mov     byte [AlarmActive], 1
     mov     byte [AlarmTriggered], 0
 
-    ; Volver al reloj
+    ; Back to the clock
+
+    mov     byte [CurrentMode], 0
+
     jmp     clock_loop
 
 alarm_left:
@@ -653,8 +588,21 @@ alarm_exit:
 
 ; =============================================================================
 ; KEYBOARD
+;
+; read_key: polls ConIn->ReadKeyStroke and maps the key to a small code:
+;     0 = no key      1 = space       3 = r / R
+;     4 = left        5 = right       6 = up          7 = down
+;     8 = m           9 = enter       10 = esc
+;
+; Owns a frame: the firmware needs 32 bytes of shadow space above the return
+; address and a 16-byte aligned RSP. Calling it straight from the caller's
+; frame let the firmware overwrite our return address with its argument spill.
 ; =============================================================================
 read_key:
+
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 32
 
     mov     rcx, [SystemTable]
     mov     rcx, [rcx + ST_ConIn]
@@ -664,86 +612,124 @@ read_key:
     call    [rcx + IN_ReadKeyStroke]
 
     test    rax, rax
-    jnz     no_key
+    jnz     .no_key
 
-    cmp     word [KeyBuf], 1
-    je      key_up
-
-    cmp     word [KeyBuf], 2
-    je      key_down
-
-    cmp     word [KeyBuf], 3
-    je      key_right
-
-    cmp     word [KeyBuf], 4
-    je      key_left
-
-    cmp     word [KeyBuf + 2], ' '
-    je      key_space
-
-    cmp     word [KeyBuf + 2], 'm'
-    je      key_m
-
-    cmp     word [KeyBuf + 2], 'r'
-    je      key_r
-
-    cmp     word [KeyBuf + 2], 'R'
-    je      key_r
-
-    cmp     word [KeyBuf + 2], 13
-    je      key_enter
-
-no_key:
-
-    xor     eax, eax
-    ret
-
-
-key_up:
+    mov     eax, 10
+    cmp     word [KeyBuf + KEY_ScanCode], SCAN_ESC
+    je      .done
 
     mov     eax, 6
-    ret
-
-
-key_down:
+    cmp     word [KeyBuf + KEY_ScanCode], SCAN_UP
+    je      .done
 
     mov     eax, 7
-    ret
-
-
-key_right:
+    cmp     word [KeyBuf + KEY_ScanCode], SCAN_DOWN
+    je      .done
 
     mov     eax, 5
-    ret
-
-
-key_left:
+    cmp     word [KeyBuf + KEY_ScanCode], SCAN_RIGHT
+    je      .done
 
     mov     eax, 4
-    ret
-
-
-key_space:
+    cmp     word [KeyBuf + KEY_ScanCode], SCAN_LEFT
+    je      .done
 
     mov     eax, 1
-    ret
-
-
-key_m:
+    cmp     word [KeyBuf + KEY_UnicodeChar], ' '
+    je      .done
 
     mov     eax, 8
-    ret
-
-
-key_r:
+    cmp     word [KeyBuf + KEY_UnicodeChar], 'm'
+    je      .done
 
     mov     eax, 3
-    ret
+    cmp     word [KeyBuf + KEY_UnicodeChar], 'r'
+    je      .done
 
-key_enter:
+    cmp     word [KeyBuf + KEY_UnicodeChar], 'R'
+    je      .done
+
     mov     eax, 9
+    cmp     word [KeyBuf + KEY_UnicodeChar], CHAR_CARRIAGE_RETURN
+    je      .done
+
+.no_key:
+
+    xor     eax, eax
+
+.done:
+
+    add     rsp, 32
+    pop     rbp
     ret
 
+
+; =============================================================================
+; CLOCK READ
+;
+; read_clock: RuntimeServices->GetTime into Time, then formats HH:MM:SS
+; into ClockString. Returns RAX = EFI_STATUS.
+; =============================================================================
+read_clock:
+
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 32
+
+    mov     rcx, [SystemTable]
+    mov     rax, [rcx + ST_RuntimeServices]
+
+    lea     rcx, [Time]
+    xor     rdx, rdx
+
+    call    [rax + RT_GetTime]
+
+    test    rax, rax
+    jnz     .done
+
+    movzx   eax, byte [Time + TIME_Hour]
+    lea     rcx, [ClockString + 0]
+    call    put_two_digits
+
+    movzx   eax, byte [Time + TIME_Minute]
+    lea     rcx, [ClockString + 6]
+    call    put_two_digits
+
+    movzx   eax, byte [Time + TIME_Second]
+    lea     rcx, [ClockString + 12]
+    call    put_two_digits
+
+    xor     eax, eax
+
+.done:
+
+    add     rsp, 32
+    pop     rbp
+    ret
+
+
+; put_two_digits: EAX = value (0..99), RCX = destination of two CHAR16
+put_two_digits:
+
+    xor     edx, edx
+    mov     r8d, 10
+    div     r8d
+
+    add     eax, '0'
+    mov     [rcx], ax
+
+    add     edx, '0'
+    mov     [rcx + 2], dx
+
+    ret
+
+
+; =============================================================================
+; ALARM
+;
+; check_alarm: compares ClockString with AlarmTime and latches AlarmTriggered.
+; Called from every mode, so the alarm fires regardless of what is on screen.
+; =============================================================================
 check_alarm:
 
     cmp     byte [AlarmActive], 1
@@ -752,27 +738,27 @@ check_alarm:
     cmp     byte [AlarmTriggered], 1
     je      .done
 
-    mov     al, [TimeString + 0]
+    mov     al, [ClockString + 0]
     cmp     al, [AlarmTime + 0]
     jne     .done
 
-    mov     al, [TimeString + 2]
+    mov     al, [ClockString + 2]
     cmp     al, [AlarmTime + 2]
     jne     .done
 
-    mov     al, [TimeString + 6]
+    mov     al, [ClockString + 6]
     cmp     al, [AlarmTime + 6]
     jne     .done
 
-    mov     al, [TimeString + 8]
+    mov     al, [ClockString + 8]
     cmp     al, [AlarmTime + 8]
     jne     .done
 
-    mov     al, [TimeString + 12]
+    mov     al, [ClockString + 12]
     cmp     al, [AlarmTime + 12]
     jne     .done
 
-    mov     al, [TimeString + 14]
+    mov     al, [ClockString + 14]
     cmp     al, [AlarmTime + 14]
     jne     .done
 
@@ -780,9 +766,72 @@ check_alarm:
 
 .done:
     ret
+
+
+; show_alarm: when triggered, prints "ALARM" on row 1 alternating white-on-red
+; and red-on-black once per second (parity of the seconds digit), then restores
+; the default attribute so the time keeps its normal colors.
+show_alarm:
+
+    push    rbp
+    mov     rbp, rsp
+    sub     rsp, 32
+
+    cmp     byte [AlarmTriggered], 1
+    jne     .done
+
+    mov     edx, EFI_WHITE | EFI_BG_RED
+
+    test    byte [ClockString + 14], 1
+    jz      .attr
+
+    mov     edx, EFI_RED
+
+.attr:
+
+    mov     rcx, [SystemTable]
+    mov     rcx, [rcx + ST_ConOut]
+
+    call    [rcx + OUT_SetAttribute]
+
+    mov     rcx, [SystemTable]
+    mov     rcx, [rcx + ST_ConOut]
+
+    xor     rdx, rdx
+    mov     r8, 1
+
+    call    [rcx + OUT_SetCursorPosition]
+
+    lea     rcx, [AlarmMessage]
+    call    print_string
+
+    mov     rcx, [SystemTable]
+    mov     rcx, [rcx + ST_ConOut]
+
+    mov     edx, EFI_LIGHTGRAY
+
+    call    [rcx + OUT_SetAttribute]
+
+.done:
+
+    add     rsp, 32
+    pop     rbp
+    ret
+
+
 ; =============================================================================
 ; RETURN
+;
+; clock_escape: Esc was pressed in any mode. Return EFI_SUCCESS so main.asm
+; shows the startup screen again.
+;
+; clock_return: leaves clock_main with RAX already holding the status
+; (an EFI error from read_clock, or EFI_SUCCESS from clock_escape).
 ; =============================================================================
+
+clock_escape:
+
+    xor     eax, eax
 
 clock_return:
 
@@ -793,6 +842,8 @@ clock_return:
 
 ; =============================================================================
 ; PRINT STRING
+;
+; RCX = CHAR16 string
 ; =============================================================================
 
 print_string:
